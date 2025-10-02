@@ -6,8 +6,7 @@ import chromium from "@sparticuz/chromium";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Helpers
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 app.get("/", (req, res) => {
   res.send("✅ m3u8-scraper API. Usa /scrape?url=...");
@@ -17,15 +16,17 @@ app.get("/scrape", async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error: "Falta parámetro ?url=" });
 
-  let browser;
-  let page;
-  const found = new Set();
+  // Configuración - ajústalas si hace falta
+  const NAV_TIMEOUT = 60000;       // tiempo máximo para navigation
+  const TOTAL_WAIT = 35000;        // espera total para sniffing después de interacciones
+  const CLICK_ROUNDS = 8;          // intentos de click para saltar ads/overlays
+  const CLICK_DELAY = 2000;        // ms entre clicks
+  const AFTER_CLICK_WAIT = 3000;   // ms a esperar tras cada click
 
-  // Timeouts/config
-  const NAV_TIMEOUT = 60000;      // 60s navegación
-  const TOTAL_WAIT = 30000;       // 30s espera total para sniffing
-  const CLICK_ROUNDS = 6;         // número de intentos de click
-  const CLICK_DELAY = 2000;       // ms entre clicks
+  let browser = null;
+  let page = null;
+  const found = new Set();
+  let responded = false;
 
   try {
     browser = await puppeteer.launch({
@@ -48,23 +49,26 @@ app.get("/scrape", async (req, res) => {
     page.setDefaultNavigationTimeout(NAV_TIMEOUT);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
 
-    // Exponer función para que el sniffer en la página nos reporte
+    // Exponer a la página una función que el sniffer JS usará para reportar m3u8 a Node
     await page.exposeFunction("reportM3u8ToNode", (u) => {
       try {
-        if (typeof u === "string" && u.includes(".m3u8")) {
+        if (u && typeof u === "string" && u.includes(".m3u8")) {
           found.add(u);
         }
-      } catch (e) { /* ignore */ }
+      } catch (e) {}
     });
 
-    // Inyectar sniffer ANTES de que se ejecute cualquier script en la página
+    // Inyectar sniffer AL INICIO (antes de cualquier script de la página)
     await page.evaluateOnNewDocument(() => {
       function safeReport(u) {
         try {
           if (u && u.indexOf && u.indexOf(".m3u8") !== -1) {
             if (window.reportM3u8ToNode) {
-              window.reportM3u8ToNode(u).catch(()=>{});
+              // report to Node (Promise)
+              try { window.reportM3u8ToNode(u); } catch (e) {}
             }
+            // también logueamos en consola por si queremos capturarlo desde page.on('console')
+            try { console.log("FOUND_M3U8_INJECT:" + u); } catch (e) {}
           }
         } catch (e) {}
       }
@@ -88,7 +92,7 @@ app.get("/scrape", async (req, res) => {
         };
       })(window.fetch);
 
-      // Parse inline HTML for m3u8 strings too (best-effort)
+      // Buscar en el HTML inicial (inline) por si hay m3u8 incrustado
       try {
         const html = document.documentElement.innerHTML || "";
         const m = html.match(/https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/i);
@@ -97,43 +101,53 @@ app.get("/scrape", async (req, res) => {
     });
 
     // También escuchamos requests/responses desde Node (doble capa)
-    page.on("request", req => {
+    page.on("request", (req) => {
       try {
         const url = req.url();
         if (url && url.includes(".m3u8")) found.add(url);
       } catch (e) {}
     });
 
-    page.on("response", async (resp) => {
+    page.on("response", (resp) => {
       try {
         const url = resp.url();
         if (url && url.includes(".m3u8")) found.add(url);
       } catch (e) {}
     });
 
-    // Navegar a la URL
+    // Capturar console logs (por si el sniffer loguea)
+    page.on("console", (msg) => {
+      try {
+        const text = msg.text();
+        if (text && text.includes("FOUND_M3U8_INJECT:")) {
+          const u = text.split("FOUND_M3U8_INJECT:")[1];
+          if (u) found.add(u.trim());
+        }
+      } catch (e) {}
+    });
+
+    // Navegar a la página
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
 
-    // Espera corta inicial para que cargue JS base
-    await sleep(2000);
+    // Pequeña espera para que la página empiece a cargar scripts
+    await sleep(1800);
 
-    // Intentos de click para forzar play si es necesario (click en centro y en frames)
+    // Intentos de click en la página + en iframes para forzar play
     for (let round = 0; round < CLICK_ROUNDS && found.size === 0; round++) {
-      // 1) click en el centro de la viewport
+      // 1) Click genérico en el centro de la viewport
       try {
-        const viewport = page.viewport();
-        const cx = Math.floor((viewport?.width || 800) / 2);
-        const cy = Math.floor((viewport?.height || 600) / 2);
-        await page.mouse.click(cx, cy, { delay: 100 });
+        const vp = page.viewport() || { width: 1280, height: 720 };
+        const cx = Math.floor((vp.width) / 2);
+        const cy = Math.floor((vp.height) / 2);
+        await page.mouse.click(cx, cy, { delay: 150 }).catch(()=>{});
       } catch (e) {}
 
-      // 2) intentar buscar botones de play dentro de frames y clickearlos
+      // 2) Buscar selectores comunes dentro de frames y clickearlos
       try {
         const frames = page.frames();
         for (const frame of frames) {
           if (!frame) continue;
           try {
-            // selectores comunes de botones play en distintos reproductores
             const selectors = [
               'button.vjs-big-play-button',
               '.vjs-big-play-button',
@@ -142,57 +156,41 @@ app.get("/scrape", async (req, res) => {
               'button.play',
               '.play-button',
               '[aria-label="Play"]',
-              'button[title*="Play"]'
+              'button[title*="Play"]',
+              'video'
             ];
             for (const sel of selectors) {
-              const btn = await frame.$(sel);
-              if (btn) {
-                await btn.click({ delay: 100 }).catch(()=>{});
-                await sleep(500);
-                break;
-              }
-            }
-            // click genérico en el centro del frame
-            const box = await frame.evaluate(() => {
-              const el = document.querySelector('video, .player, .play, button.vjs-big-play-button');
+              const el = await frame.$(sel);
               if (el) {
-                const r = el.getBoundingClientRect();
-                return { x: r.left + r.width/2, y: r.top + r.height/2 };
+                try { await el.click({ delay: 100 }); } catch (e) {}
+                await sleep(400);
               }
-              return null;
-            });
-            if (box) {
-              // coords are relative to viewport; use page.mouse
-              await page.mouse.click(Math.floor(box.x), Math.floor(box.y), { delay: 100 }).catch(()=>{});
             }
           } catch (e) {}
         }
       } catch (e) {}
 
-      // 3) si han aparecido nuevas páginas (popups), ciérralas
+      // 3) Cerrar popups/pestañas nuevas si aparecen
       try {
         const pages = await browser.pages();
         if (pages.length > 1) {
-          // cerramos pestañas adicionales (normalmente los popups están al final)
           for (let i = pages.length - 1; i > 0; i--) {
-            try {
-              await pages[i].close();
-            } catch (e) {}
+            try { await pages[i].close(); } catch (e) {}
           }
         }
       } catch (e) {}
 
-      // small wait before next round
-      await sleep(CLICK_DELAY);
+      // Esperar un poco para que peticiones de la reproducción aparezcan
+      await sleep(AFTER_CLICK_WAIT);
     }
 
-    // Después de los clicks, esperamos un tiempo para que salgan requests
-    const start = Date.now();
-    while (Date.now() - start < TOTAL_WAIT && found.size === 0) {
-      await sleep(500);
+    // Después de interacciones, esperar un tiempo total para sniffing
+    const started = Date.now();
+    while (Date.now() - started < TOTAL_WAIT && found.size === 0) {
+      await sleep(300);
     }
 
-    // Si no encontró nada en toda la espera, intentamos revisar frames con evaluate (HTML)
+    // Si aún no encontró nada, revisar el contenido de frames (búsqueda en HTML)
     if (found.size === 0) {
       try {
         const frames = page.frames();
@@ -206,21 +204,21 @@ app.get("/scrape", async (req, res) => {
       } catch (e) {}
     }
 
-    // Preparar respuesta
     const arr = Array.from(found);
     if (arr.length > 0) {
-      // Responder con todos los m3u8 encontrados (normalmente el primero es la real)
+      responded = true;
       return res.json({ success: true, m3u8s: arr });
     } else {
+      responded = true;
       return res.json({ success: false, error: "No se encontró ningún .m3u8 en la página" });
     }
 
   } catch (err) {
     console.error("Error scraper:", err);
-    return res.status(500).json({ error: String(err.message || err) });
+    if (!responded) return res.status(500).json({ error: String(err.message || err) });
   } finally {
     try { if (page && !page.isClosed && typeof page.close === "function") await page.close(); } catch(e){}
-    try { if (browser) await browser.close(); } catch (e){}
+    try { if (browser) await browser.close(); } catch(e){}
   }
 });
 
