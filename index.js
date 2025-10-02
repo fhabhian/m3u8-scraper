@@ -1,23 +1,79 @@
-// index.js (hardcore m3u8 sniffer)
+// index.js - m3u8 scraper + submit/get endpoints (hardcore + mixto)
+// Requisitos en package.json: "type":"module", deps: express, puppeteer-core, @sparticuz/chromium
+
 import express from "express";
 import puppeteer from "puppeteer-core";
 import chromium from "@sparticuz/chromium";
+import crypto from "crypto";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// ----------------- CONFIG -----------------
+const NAV_TIMEOUT = 60000;      // ms for page.goto
+const TOTAL_WAIT = 90000;       // ms total sniffing wait
+const CLICK_ROUNDS = 12;        // attempts to click
+const CLICK_DELAY = 2500;       // ms between clicks
+const AFTER_CLICK_WAIT = 2000;  // wait after click
 
+// Temp store for mixto flow
+const TEMP_STORE = new Map();
+const DEFAULT_TTL = 90 * 1000; // ms (90s default) - ajuste según necesites
+
+function makeKey() {
+  return crypto.randomBytes(12).toString("hex");
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Middleware para JSON en /submit
+app.use(express.json({ limit: "16kb" }));
+
+// ----------------- BASIC ROUTES -----------------
+app.get("/", (req, res) => {
+  res.send("✅ m3u8-scraper API. Endpoints: GET /scrape?url=..., POST /submit, GET /get?key=...");
+});
+
+// ----------------- MIXED FLOW: submit / get -----------------
+app.post("/submit", (req, res) => {
+  try {
+    const { m3u8, referer } = req.body || {};
+    if (!m3u8 || typeof m3u8 !== "string") {
+      return res.status(400).json({ success: false, error: "Missing m3u8" });
+    }
+    const key = makeKey();
+    const expiresAt = Date.now() + DEFAULT_TTL;
+    TEMP_STORE.set(key, { m3u8, referer: referer || null, expiresAt });
+    // Auto-delete after TTL
+    setTimeout(() => TEMP_STORE.delete(key), DEFAULT_TTL + 2000);
+    console.log(`[SUBMIT] key=${key} stored for ${DEFAULT_TTL/1000}s (referer=${referer || 'n/a'})`);
+    return res.json({ success: true, key, expires_in: Math.floor(DEFAULT_TTL/1000) });
+  } catch (err) {
+    console.error("submit error:", err);
+    return res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+app.get("/get", (req, res) => {
+  try {
+    const key = req.query.key;
+    if (!key) return res.status(400).json({ success: false, error: "Missing key" });
+    const item = TEMP_STORE.get(key);
+    if (!item) return res.status(404).json({ success: false, error: "Key not found or expired" });
+    // delete on read to avoid reuse
+    TEMP_STORE.delete(key);
+    console.log(`[GET] key=${key} served (referer=${item.referer || 'n/a'})`);
+    return res.json({ success: true, m3u8: item.m3u8, referer: item.referer });
+  } catch (err) {
+    console.error("get error:", err);
+    return res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+// ----------------- HARDCORE SCRAPER: /scrape -----------------
 app.get("/scrape", async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ success: false, error: "Falta parámetro ?url=" });
-
-  // Configurables
-  const NAV_TIMEOUT = 60000;      // tiempo para goto
-  const TOTAL_WAIT = 90000;       // tiempo máximo total de sniffing (ms)
-  const CLICK_ROUNDS = 12;        // intentos de click
-  const CLICK_DELAY = 2500;       // ms entre clicks
-  const AFTER_CLICK_WAIT = 2000;  // espera tras click
 
   let browser = null;
   let page = null;
@@ -25,6 +81,8 @@ app.get("/scrape", async (req, res) => {
   let responded = false;
 
   try {
+    console.log(`[SCRAPE] Starting scrape for: ${targetUrl}`);
+
     browser = await puppeteer.launch({
       args: [
         ...chromium.args,
@@ -45,36 +103,44 @@ app.get("/scrape", async (req, res) => {
     page.setDefaultNavigationTimeout(NAV_TIMEOUT);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
 
-    // ---------- 1) CDP Network listener (no perder requests) ----------
+    // 1) CDP listeners to not lose requests
     const client = await page.target().createCDPSession();
     await client.send("Network.enable");
 
     client.on("Network.requestWillBeSent", (ev) => {
       try {
         const url = ev?.request?.url;
-        if (url && url.includes(".m3u8")) found.add(url);
+        if (url && url.includes(".m3u8")) {
+          found.add(url);
+          console.log("[CDP] requestWillBeSent", url);
+        }
       } catch (e) {}
     });
 
     client.on("Network.responseReceived", (ev) => {
       try {
         const url = ev?.response?.url;
-        if (url && url.includes(".m3u8")) found.add(url);
+        if (url && url.includes(".m3u8")) {
+          found.add(url);
+          console.log("[CDP] responseReceived", url);
+        }
       } catch (e) {}
     });
 
-    // ---------- 2) request interception (equiv. shouldInterceptRequest) ----------
+    // 2) request interception (shouldInterceptRequest-like)
     await page.setRequestInterception(true);
     page.on("request", (r) => {
       try {
         const url = r.url();
-        if (url && url.includes(".m3u8")) found.add(url);
+        if (url && url.includes(".m3u8")) {
+          found.add(url);
+          console.log("[REQ] intercepted", url);
+        }
       } catch (e) {}
-      // siempre continuar (no bloquear)
-      try { r.continue(); } catch (e) { try { r.continue(); } catch (er){} }
+      try { r.continue(); } catch (e) { try { r.continue(); } catch(_){} }
     });
 
-    // ---------- 3) Inyectar sniffer JS ANTES de cualquier script (igual al PlayerActivity) ----------
+    // 3) inject sniffer JS before any script runs (like PlayerActivity)
     await page.evaluateOnNewDocument(() => {
       function safeReport(u) {
         try {
@@ -86,14 +152,12 @@ app.get("/scrape", async (req, res) => {
           }
         } catch (e) {}
       }
-
       (function(open) {
         XMLHttpRequest.prototype.open = function(method, url) {
           try { safeReport(url); } catch (e) {}
           return open.apply(this, arguments);
         };
       })(XMLHttpRequest.prototype.open);
-
       (function(fetchOrig) {
         window.fetch = function(input, init) {
           try {
@@ -103,8 +167,7 @@ app.get("/scrape", async (req, res) => {
           return fetchOrig.apply(this, arguments);
         };
       })(window.fetch);
-
-      // buscar en el HTML inline inicial
+      // inline HTML scan
       try {
         const html = document.documentElement.innerHTML || "";
         const m = html.match(/https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/i);
@@ -112,29 +175,50 @@ app.get("/scrape", async (req, res) => {
       } catch (e) {}
     });
 
-    // ---------- 4) También escuchar console logs por si el sniffer loguea ----------
+    // 4) also listen console logs
     page.on("console", (msg) => {
       try {
         const text = msg.text();
         if (text && text.includes("FOUND_M3U8_INJECT:")) {
           const u = text.split("FOUND_M3U8_INJECT:")[1];
-          if (u) found.add(u.trim());
+          if (u) {
+            found.add(u.trim());
+            console.log("[CONSOLE] injected sniffer found", u.trim());
+          }
         }
       } catch (e) {}
     });
 
-    // ---------- 5) Navegar a la página ----------
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
+    // 5) also listen request/response node-side (extra)
+    page.on("request", req => {
+      try {
+        const u = req.url();
+        if (u && u.includes(".m3u8")) {
+          found.add(u);
+          console.log("[PAGE REQUEST] " + u);
+        }
+      } catch (e) {}
+    });
+    page.on("response", resp => {
+      try {
+        const u = resp.url();
+        if (u && u.includes(".m3u8")) {
+          found.add(u);
+          console.log("[PAGE RESPONSE] " + u);
+        }
+      } catch (e) {}
+    });
 
-    // pequeña espera para que scripts base empiecen
+    // 6) navigate
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
     await sleep(1200);
 
-    // Si hay iframes, inyectar sniffer en cada frame ya existente
+    // helper to inject sniffer into existing frames (best-effort)
     async function injectToFrames() {
       const frames = page.frames();
       for (const frame of frames) {
         try {
-          // ejecutar en frame context (no rompe si cross-origin; atrapamos errores)
+          // try to evaluate inside frame; cross-origin frames will throw and be skipped
           await frame.evaluate(() => {
             function safeReport(u) {
               try {
@@ -169,36 +253,27 @@ app.get("/scrape", async (req, res) => {
 
     await injectToFrames().catch(()=>{});
 
-    // ---------- 6) Click loops + frame clicks + cerrar popups ----------
-    const startClicks = Date.now();
-    for (let round = 0; round < CLICK_ROUNDS && (Date.now() - startClicks) < (TOTAL_WAIT/2) && found.size === 0; round++) {
+    // 7) click loops + frame clicks + close popups
+    const clickStart = Date.now();
+    for (let round = 0; round < CLICK_ROUNDS && (Date.now() - clickStart) < (TOTAL_WAIT/2) && found.size === 0; round++) {
       try {
-        // click center viewport
         const vp = page.viewport() || { width: 1280, height: 720 };
         await page.mouse.click(Math.floor(vp.width/2), Math.floor(vp.height/2), { delay: 100 }).catch(()=>{});
       } catch (e) {}
 
-      // try clicking common selectors inside frames
+      // click common selectors inside frames
       const frames = page.frames();
       for (const frame of frames) {
         try {
-          // selectors comunes
           const selectors = [
-            'button.vjs-big-play-button',
-            '.vjs-big-play-button',
-            '.jw-icon-play',
-            '.jw-button-color.jw-icon-playback',
-            'button.play',
-            '.play-button',
-            '[aria-label="Play"]',
-            'button[title*="Play"]',
-            'video'
+            'button.vjs-big-play-button',' .vjs-big-play-button',' .jw-icon-play',' .jw-button-color.jw-icon-playback',
+            'button.play','.play-button','[aria-label="Play"]','button[title*="Play"]','video'
           ];
           for (const sel of selectors) {
             try {
               const el = await frame.$(sel);
               if (el) {
-                try { await el.click({ delay: 80 }); } catch (e) {}
+                try { await el.click({ delay: 80 }); } catch {}
                 await sleep(300);
               }
             } catch (e) {}
@@ -206,7 +281,7 @@ app.get("/scrape", async (req, res) => {
         } catch (e) {}
       }
 
-      // cerrar popups si aparecen
+      // close popups (additional pages)
       try {
         const pages = await browser.pages();
         if (pages.length > 1) {
@@ -216,15 +291,13 @@ app.get("/scrape", async (req, res) => {
         }
       } catch (e) {}
 
-      // inyectar a frames de nuevo (por si se añadieron nuevos)
       await injectToFrames().catch(()=>{});
       await sleep(CLICK_DELAY);
     }
 
-    // ---------- 7) Espera total para sniffing (lectura de window.__FOUND_M3U8__ también) ----------
-    const start = Date.now();
-    while ((Date.now() - start) < TOTAL_WAIT && found.size === 0) {
-      // chequear sniffer variables dentro de page y frames
+    // 8) final wait loop reading window.__FOUND_M3U8__ on page and frames
+    const sniffStart = Date.now();
+    while ((Date.now() - sniffStart) < TOTAL_WAIT && found.size === 0) {
       try {
         const pageFound = await page.evaluate(() => {
           try { return window.__FOUND_M3U8__ || null; } catch (e) { return null; }
@@ -249,7 +322,7 @@ app.get("/scrape", async (req, res) => {
       await sleep(500);
     }
 
-    // ---------- 8) fallback: scan HTML of frames/pages for inline m3u8 strings ----------
+    // 9) fallback: scan frame HTML for inline m3u8 strings
     if (found.size === 0) {
       try {
         const frames = page.frames();
@@ -268,12 +341,13 @@ app.get("/scrape", async (req, res) => {
     const result = Array.from(found);
     if (result.length > 0) {
       responded = true;
+      console.log(`[SCRAPE] Found ${result.length} m3u8(s). Returning first ones.`);
       return res.json({ success: true, m3u8s: result });
     } else {
       responded = true;
+      console.log("[SCRAPE] No m3u8 found for", targetUrl);
       return res.json({ success: false, error: "No se encontró ningún .m3u8 en la página" });
     }
-
   } catch (err) {
     console.error("Scraper error:", err);
     if (!responded) return res.status(500).json({ success: false, error: String(err.message || err) });
@@ -283,6 +357,7 @@ app.get("/scrape", async (req, res) => {
   }
 });
 
+// ----------------- START -----------------
 app.listen(PORT, () => {
-  console.log(`🚀 m3u8-scraper hardcore listo en puerto ${PORT}`);
+  console.log(`🚀 m3u8-scraper hardcore + submit/get listo en puerto ${PORT}`);
 });
