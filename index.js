@@ -11,62 +11,71 @@ app.get("/", (req, res) => {
 
 app.get("/scrape", async (req, res) => {
   const targetUrl = req.query.url;
-  if (!targetUrl) {
-    return res.json({ error: "Falta parámetro ?url=" });
-  }
+  if (!targetUrl) return res.json({ error: "Falta parámetro ?url=" });
 
   let browser;
   try {
     browser = await puppeteer.launch({
-      args: [
-        ...chromium.args,
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-      ],
+      args: chromium.args,
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
+      ignoreHTTPSErrors: true,
     });
 
     const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(60000);
 
-    let m3u8Url = null;
+    let m3u8Found = null;
 
-    // Escuchar TODAS las respuestas
-    page.on("response", async (response) => {
-      const url = response.url();
-      if (url.includes(".m3u8") && !m3u8Url) {
-        m3u8Url = url;
-        console.log("🎯 Encontrado m3u8:", url);
+    // Exponer función al navegador
+    await page.exposeFunction("reportStream", (url) => {
+      if (url.includes(".m3u8") && !m3u8Found) {
+        m3u8Found = url;
       }
     });
 
-    // Navegar a la página
+    // Inyectar sniffer antes de cargar la página
+    await page.evaluateOnNewDocument(() => {
+      function report(u) {
+        if (u && u.indexOf(".m3u8") !== -1) {
+          window.reportStream(u);
+        }
+      }
+      const origOpen = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (m, u) {
+        try { report(u); } catch {}
+        return origOpen.apply(this, arguments);
+      };
+      const origFetch = window.fetch;
+      window.fetch = function (...args) {
+        try {
+          const u = typeof args[0] === "string" ? args[0] : args[0].url;
+          report(u);
+        } catch {}
+        return origFetch.apply(this, args);
+      };
+    });
+
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // Esperar hasta 15 seg máximo a que aparezca un m3u8
+    // Esperar hasta 30s que aparezca un m3u8
+    const maxWait = 30000;
     const start = Date.now();
-    while (!m3u8Url && Date.now() - start < 15000) {
-      await new Promise((r) => setTimeout(r, 500));
+    while (!m3u8Found && Date.now() - start < maxWait) {
+      await new Promise(r => setTimeout(r, 500));
     }
 
-    await browser.close();
-
-    if (m3u8Url) {
-      return res.json({ m3u8: m3u8Url });
+    if (m3u8Found) {
+      res.json({ success: true, m3u8: m3u8Found });
     } else {
-      return res.json({ error: "No se encontró ningún .m3u8 en la página" });
+      res.json({ error: "No se encontró ningún .m3u8 en la página" });
     }
+
   } catch (err) {
-    console.error("❌ Error:", err);
-    if (browser) await browser.close();
     res.json({ error: err.message });
+  } finally {
+    if (browser) await browser.close();
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log("Servidor corriendo en puerto", PORT));
