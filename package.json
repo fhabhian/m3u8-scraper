@@ -2,9 +2,12 @@
   "name": "m3u8-scraper",
   "version": "1.0.0",
   "main": "index.js",
-  "license": "MIT",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "express": "^4.18.2",
-    "puppeteer": "^22.0.0"
+    "puppeteer-core": "^21.6.1",
+    "@sparticuz/chromium": "^122.0.0"
   }
 }
